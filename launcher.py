@@ -34,6 +34,8 @@ VERSION_FILE = LAUNCHER_DIR / "version.txt"
 APP_DIR = LAUNCHER_DIR / "App"
 EXE_PATH = APP_DIR / EXE_NAME
 DREAMBOT_SCRIPTS = Path(os.path.expandvars(r"%USERPROFILE%\DreamBot\Scripts"))
+LAST_CHECK_FILE = LAUNCHER_DIR / ".last_update_check"
+CHECK_INTERVAL_HOURS = 1  # only hit GitHub API once per hour per install
 
 
 def find_exe() -> Path | None:
@@ -64,6 +66,29 @@ def read_local_version() -> str:
 
 def write_local_version(tag: str) -> None:
     VERSION_FILE.write_text(tag)
+
+
+def _read_last_check_time() -> float:
+    try:
+        if LAST_CHECK_FILE.exists():
+            return float(LAST_CHECK_FILE.read_text().strip())
+    except Exception:
+        pass
+    return 0.0
+
+
+def _write_last_check_time() -> None:
+    try:
+        LAST_CHECK_FILE.write_text(str(time.time()))
+    except Exception:
+        pass
+
+
+def _should_check_github() -> bool:
+    """Return True if enough time has passed since the last GitHub API check."""
+    last_check = _read_last_check_time()
+    elapsed_hours = (time.time() - last_check) / 3600
+    return elapsed_hours >= CHECK_INTERVAL_HOURS
 
 
 def fmt_size(n: int) -> str:
@@ -283,23 +308,33 @@ class LauncherGUI:
     def _worker(self):
         local_version = read_local_version()
         self.set_version(f"Installed: v{local_version}")
-        self.set_status("Checking GitHub for updates...")
-
-        release, err = fetch_latest_release()
         local_exe = find_exe()
+
+        # If we already have an install and checked recently, skip GitHub entirely
+        if local_exe and not _should_check_github():
+            self.set_status("Launching Farm Manager...", SUCCESS)
+            self.set_detail("Update check skipped (checked recently)")
+            self.root.after(1000, self._launch)
+            return
+
+        self.set_status("Checking GitHub for updates...")
+        release, err = fetch_latest_release()
         if not release:
-            self.set_status("Update check failed", ERROR)
-            self.set_detail(err or "No internet connection")
             if local_exe:
-                self.set_detail(f"Launching existing install: {local_exe.name}")
-                self.root.after(3000, self._launch)
+                # Silent fallback: don't scare the user with a red error when the local install works
+                self.set_status("Launching Farm Manager...", SUCCESS)
+                self.set_detail(f"Update check unavailable ({err or 'no internet'}), using installed version")
+                self.root.after(1500, self._launch)
             else:
+                self.set_status("Update check failed", ERROR)
+                self.set_detail(err or "No internet connection")
                 self.root.after(3000, lambda: self._fatal(
                     "No release found and no local install.\n"
                     "Publish a release on GitHub or place the app in the App/ folder."
                 ))
             return
 
+        _write_last_check_time()
         remote_tag = release.get("tag_name", "0.0.0").lstrip("v")
         self.set_version(f"Installed: v{local_version}  |  Latest: v{remote_tag}")
 
@@ -386,44 +421,48 @@ def console_main():
 
     local_version = read_local_version()
     print(f"[LAUNCHER] Installed version: {local_version}")
+    local_exe = find_exe()
 
-    release, err = fetch_latest_release()
-    if not release:
-        print(f"[LAUNCHER] {err or 'Could not reach GitHub'}")
-        exe = find_exe()
-        if exe:
-            print("[LAUNCHER] Launching existing install ...")
-        else:
-            print(f"[LAUNCHER] ERROR: No release found and no local install.")
-            print("[LAUNCHER] Run from the install folder (not from ZIP/RAR).")
-            input("Press Enter to exit...")
-            sys.exit(1)
+    if local_exe and not _should_check_github():
+        print("[LAUNCHER] Update check skipped (checked recently), launching existing install...")
     else:
-        remote_tag = release.get("tag_name", "0.0.0").lstrip("v")
-        print(f"[LAUNCHER] Latest release: v{remote_tag}")
-
-        if remote_tag != local_version:
-            print(f"[LAUNCHER] Update available: {local_version} -> {remote_tag}")
-            assets = release.get("assets", [])
-
-            zip_asset = find_asset(assets, ZIP_ASSET_NAME)
-            if zip_asset:
-                zip_path = LAUNCHER_DIR / ZIP_ASSET_NAME
-                if download_file(zip_asset["browser_download_url"], zip_path):
-                    if extract_zip(zip_path, APP_DIR):
-                        zip_path.unlink(missing_ok=True)
-
-            jar_asset = find_asset(assets, JAR_ASSET_NAME)
-            if jar_asset:
-                jar_path = LAUNCHER_DIR / JAR_ASSET_NAME
-                if download_file(jar_asset["browser_download_url"], jar_path):
-                    install_jar(jar_path)
-                    jar_path.unlink(missing_ok=True)
-
-            write_local_version(remote_tag)
-            print(f"[LAUNCHER] Updated to v{remote_tag}")
+        release, err = fetch_latest_release()
+        if not release:
+            if local_exe:
+                print(f"[LAUNCHER] {err or 'Could not reach GitHub'} — launching existing install...")
+            else:
+                print(f"[LAUNCHER] ERROR: {err or 'Could not reach GitHub'}")
+                print("[LAUNCHER] No release found and no local install.")
+                print("[LAUNCHER] Run from the install folder (not from ZIP/RAR).")
+                input("Press Enter to exit...")
+                sys.exit(1)
         else:
-            print("[LAUNCHER] Already up to date.")
+            _write_last_check_time()
+            remote_tag = release.get("tag_name", "0.0.0").lstrip("v")
+            print(f"[LAUNCHER] Latest release: v{remote_tag}")
+
+            if remote_tag != local_version:
+                print(f"[LAUNCHER] Update available: {local_version} -> {remote_tag}")
+                assets = release.get("assets", [])
+
+                zip_asset = find_asset(assets, ZIP_ASSET_NAME)
+                if zip_asset:
+                    zip_path = LAUNCHER_DIR / ZIP_ASSET_NAME
+                    if download_file(zip_asset["browser_download_url"], zip_path):
+                        if extract_zip(zip_path, APP_DIR):
+                            zip_path.unlink(missing_ok=True)
+
+                jar_asset = find_asset(assets, JAR_ASSET_NAME)
+                if jar_asset:
+                    jar_path = LAUNCHER_DIR / JAR_ASSET_NAME
+                    if download_file(jar_asset["browser_download_url"], jar_path):
+                        install_jar(jar_path)
+                        jar_path.unlink(missing_ok=True)
+
+                write_local_version(remote_tag)
+                print(f"[LAUNCHER] Updated to v{remote_tag}")
+            else:
+                print("[LAUNCHER] Already up to date.")
 
     exe = find_exe()
     if not exe:
